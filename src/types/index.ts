@@ -66,3 +66,30 @@ export interface ViewportSize {
   width: number
   height: number
 }
+
+export interface SphereMask {
+  id: string
+  centerX: number
+  centerY: number
+  centerZ: number
+  radius: number
+  color?: string
+}
+
+export interface MaskVolumeResult {
+  voxelCount: number
+  volumeMm3: number
+  volumeCm3: number
+  surfaceAreaMm2?: number
+}
+
+export type MaskToolMode = 'none' | 'draw' | 'erase' | 'measure'
+
+export interface MaskState {
+  enabled: boolean
+  mode: MaskToolMode
+  brushRadius: number
+  spheres: SphereMask[]
+  totalVolume: MaskVolumeResult
+  activeSphereId: string | null
+}

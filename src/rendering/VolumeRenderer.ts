@@ -1,18 +1,22 @@
 import * as THREE from 'three'
-import type { VolumeData, MPRPlane, MPRViewState, ViewportSize } from '@/types'
+import type { VolumeData, MPRPlane, MPRViewState, ViewportSize, SphereMask, MaskToolMode } from '@/types'
 import { DoubleBufferManager } from '@/concurrency/DoubleBufferManager'
 import { TaskScheduler, debounceWithPriority, TASK_PRIORITY_HIGH, TASK_PRIORITY_CRITICAL } from '@/concurrency/TaskScheduler'
+import { MaskManager } from '@/mask/MaskManager'
 import vertexShader from './shaders/volume.vert?raw'
 import fragmentShader from './shaders/volume.frag?raw'
 
 const TEXTURE_UPDATE_DEBOUNCE_MS = 16
 const VOLUME_VALUE_SCALE = 4095.0
+const DEFAULT_MASK_OPACITY = 0.85
+const DEFAULT_BRUSH_RADIUS = 5.0
 
 export class VolumeRenderer {
   private scene: THREE.Scene
   private camera: THREE.OrthographicCamera
   private renderer: THREE.WebGLRenderer
   private volumeTexture: THREE.Data3DTexture | null = null
+  private maskTexture: THREE.Data3DTexture | null = null
   private planeMesh: THREE.Mesh | null = null
   private material: THREE.ShaderMaterial | null = null
   private volumeData: VolumeData | null = null
@@ -33,6 +37,15 @@ export class VolumeRenderer {
   private pendingWindowWidth: number | null = null
   private pendingWindowLevel: number | null = null
 
+  private maskManager: MaskManager
+  private maskEnabled: boolean = false
+  private maskOpacity: number = DEFAULT_MASK_OPACITY
+  private brushRadius: number = DEFAULT_BRUSH_RADIUS
+  private maskToolMode: MaskToolMode = 'none'
+  private isBrushDrawing: boolean = false
+  private maskTextureDirty: boolean = false
+  private onMaskChangedCallback: (() => void) | null = null
+
   constructor(container: HTMLElement, plane: MPRPlane) {
     this.container = container
     this.viewState = {
@@ -45,6 +58,7 @@ export class VolumeRenderer {
     }
 
     this.textureUploadScheduler = new TaskScheduler(1)
+    this.maskManager = new MaskManager()
 
     this.scene = new THREE.Scene()
     this.scene.background = new THREE.Color(0x0f1218)
@@ -75,9 +89,18 @@ export class VolumeRenderer {
     window.addEventListener('mousemove', this.handleMouseMove.bind(this))
     window.addEventListener('mouseup', this.handleMouseUp.bind(this))
     canvas.addEventListener('dblclick', this.handleDoubleClick.bind(this))
+    canvas.addEventListener('mouseleave', this.handleMouseLeave.bind(this))
   }
 
   private handleWheel(event: WheelEvent): void {
+    if (this.maskToolMode === 'draw' || this.maskToolMode === 'erase') {
+      event.preventDefault()
+      const delta = event.deltaY > 0 ? 0.9 : 1.1
+      this.brushRadius = Math.max(1, Math.min(50, this.brushRadius * delta))
+      this.needsRender = true
+      return
+    }
+
     event.preventDefault()
     const delta = event.deltaY > 0 ? 0.9 : 1.1
     this.viewState.zoom = Math.max(0.1, Math.min(10, this.viewState.zoom * delta))
@@ -87,17 +110,27 @@ export class VolumeRenderer {
 
   private handleMouseDown(event: MouseEvent): void {
     if (event.button === 0) {
+      if (this.maskToolMode === 'draw' || this.maskToolMode === 'erase') {
+        this.isBrushDrawing = true
+        this.applyBrushAtMouse(event.clientX, event.clientY)
+        return
+      }
+
       this.isDragging = true
       this.lastMousePos = { x: event.clientX, y: event.clientY }
     }
   }
 
   private handleMouseMove(event: MouseEvent): void {
+    if (this.isBrushDrawing && (this.maskToolMode === 'draw' || this.maskToolMode === 'erase')) {
+      this.applyBrushAtMouse(event.clientX, event.clientY)
+      return
+    }
+
     if (this.isDragging) {
       const dx = event.clientX - this.lastMousePos.x
       const dy = event.clientY - this.lastMousePos.y
 
-      const aspect = this.renderer.domElement.clientWidth / this.renderer.domElement.clientHeight
       const panSpeed = 2 / this.viewState.zoom
 
       this.viewState.pan.x += (dx / this.renderer.domElement.clientWidth) * panSpeed
@@ -110,7 +143,15 @@ export class VolumeRenderer {
   }
 
   private handleMouseUp(): void {
+    if (this.isBrushDrawing) {
+      this.isBrushDrawing = false
+      return
+    }
     this.isDragging = false
+  }
+
+  private handleMouseLeave(): void {
+    this.isBrushDrawing = false
   }
 
   private handleDoubleClick(): void {
@@ -120,12 +161,55 @@ export class VolumeRenderer {
     this.needsRender = true
   }
 
+  private applyBrushAtMouse(clientX: number, clientY: number): void {
+    if (!this.volumeData) return
+
+    const rect = this.renderer.domElement.getBoundingClientRect()
+    const x = ((clientX - rect.left) / rect.width) * 2 - 1
+    const y = -(((clientY - rect.top) / rect.height) * 2 - 1)
+
+    const sphereParams = this.maskManager.screenToWorldSphere(
+      this.viewState.plane,
+      this.getSliceIndex(),
+      x,
+      y,
+      this.brushRadius,
+      this.viewState.zoom,
+      this.viewState.pan
+    )
+
+    if (!sphereParams) return
+
+    if (this.maskToolMode === 'draw') {
+      this.maskManager.addSphere(
+        sphereParams.centerX,
+        sphereParams.centerY,
+        sphereParams.centerZ,
+        sphereParams.radius
+      )
+    } else if (this.maskToolMode === 'erase') {
+    }
+
+    this.maskTextureDirty = true
+    this.needsRender = true
+
+    if (this.onMaskChangedCallback) {
+      this.onMaskChangedCallback()
+    }
+  }
+
   setVolumeData(volumeData: VolumeData): void {
     this.volumeData = volumeData
+    this.maskManager.setVolumeData(volumeData)
 
     if (this.volumeTexture) {
       this.volumeTexture.dispose()
       this.volumeTexture = null
+    }
+
+    if (this.maskTexture) {
+      this.maskTexture.dispose()
+      this.maskTexture = null
     }
 
     const { width, height, depth } = volumeData.dimensions
@@ -162,6 +246,8 @@ export class VolumeRenderer {
       this.doubleBuffer = null
       this.volumeTexture = this.create3DTextureFromVolume(volumeData)
     }
+
+    this.createMaskTexture(width, height, depth)
 
     this.viewState.windowLevel = (volumeData.minValue + volumeData.maxValue) / 2
     this.viewState.windowWidth = volumeData.maxValue - volumeData.minValue
@@ -208,6 +294,37 @@ export class VolumeRenderer {
     return this.create3DTexture(data, width, height, depth)
   }
 
+  private createMaskTexture(width: number, height: number, depth: number): void {
+    const maskData = new Uint8Array(width * height * depth)
+
+    this.maskTexture = new THREE.Data3DTexture(maskData, width, height, depth)
+    this.maskTexture.format = THREE.RedFormat
+    this.maskTexture.type = THREE.UnsignedByteType
+    this.maskTexture.minFilter = THREE.LinearFilter
+    this.maskTexture.magFilter = THREE.LinearFilter
+    this.maskTexture.wrapS = THREE.ClampToEdgeWrapping
+    this.maskTexture.wrapT = THREE.ClampToEdgeWrapping
+    this.maskTexture.wrapR = THREE.ClampToEdgeWrapping
+    this.maskTexture.needsUpdate = true
+    this.maskTexture.unpackAlignment = 1
+  }
+
+  private updateMaskTexture(): void {
+    if (!this.maskTexture) return
+
+    const maskData = this.maskManager.getMaskTextureData()
+    if (!maskData) return
+
+    const textureImage = this.maskTexture.image
+    if (textureImage && textureImage.data) {
+      const dstData = textureImage.data as unknown as Uint8Array
+      dstData.set(maskData)
+    }
+
+    this.maskTexture.needsUpdate = true
+    this.maskTextureDirty = false
+  }
+
   private createPlaneMesh(): void {
     if (this.planeMesh) {
       this.scene.remove(this.planeMesh)
@@ -225,6 +342,7 @@ export class VolumeRenderer {
       fragmentShader,
       uniforms: {
         u_volumeTexture: { value: this.volumeTexture },
+        u_maskTexture: { value: this.maskTexture },
         u_volumeDimensions: { value: new THREE.Vector3(
           this.volumeData?.dimensions.width || 0,
           this.volumeData?.dimensions.height || 0,
@@ -244,7 +362,9 @@ export class VolumeRenderer {
         u_minValue: { value: this.volumeData?.minValue || 0 },
         u_maxValue: { value: this.volumeData?.maxValue || 0 },
         u_valueScale: { value: VOLUME_VALUE_SCALE },
-        u_frameToken: { value: 0.0 }
+        u_frameToken: { value: 0.0 },
+        u_maskEnabled: { value: this.maskEnabled ? 1 : 0 },
+        u_maskOpacity: { value: this.maskOpacity }
       },
       depthTest: false,
       depthWrite: false
@@ -271,6 +391,8 @@ export class VolumeRenderer {
     this.material.uniforms.u_windowLevel.value = this.viewState.windowLevel
     this.material.uniforms.u_zoom.value = this.viewState.zoom
     this.material.uniforms.u_pan.value.set(this.viewState.pan.x, this.viewState.pan.y)
+    this.material.uniforms.u_maskEnabled.value = this.maskEnabled ? 1 : 0
+    this.material.uniforms.u_maskOpacity.value = this.maskOpacity
   }
 
   private scheduleTextureUpdate = debounceWithPriority(
@@ -361,6 +483,64 @@ export class VolumeRenderer {
     this.needsRender = true
   }
 
+  setMaskEnabled(enabled: boolean): void {
+    this.maskEnabled = enabled
+    this.updateMaterialUniforms()
+    this.needsRender = true
+  }
+
+  getMaskEnabled(): boolean {
+    return this.maskEnabled
+  }
+
+  setMaskOpacity(opacity: number): void {
+    this.maskOpacity = Math.max(0, Math.min(1, opacity))
+    this.updateMaterialUniforms()
+    this.needsRender = true
+  }
+
+  setBrushRadius(radius: number): void {
+    this.brushRadius = Math.max(1, Math.min(100, radius))
+    this.needsRender = true
+  }
+
+  getBrushRadius(): number {
+    return this.brushRadius
+  }
+
+  setMaskToolMode(mode: MaskToolMode): void {
+    this.maskToolMode = mode
+
+    const canvas = this.renderer.domElement
+    if (mode === 'draw' || mode === 'erase') {
+      canvas.style.cursor = 'crosshair'
+    } else {
+      canvas.style.cursor = 'grab'
+    }
+  }
+
+  getMaskToolMode(): MaskToolMode {
+    return this.maskToolMode
+  }
+
+  getMaskManager(): MaskManager {
+    return this.maskManager
+  }
+
+  clearMask(): void {
+    this.maskManager.clearAllSpheres()
+    this.maskTextureDirty = true
+    this.needsRender = true
+
+    if (this.onMaskChangedCallback) {
+      this.onMaskChangedCallback()
+    }
+  }
+
+  setOnMaskChanged(callback: (() => void) | null): void {
+    this.onMaskChangedCallback = callback
+  }
+
   getDoubleBuffer(): DoubleBufferManager | null {
     return this.doubleBuffer
   }
@@ -401,6 +581,10 @@ export class VolumeRenderer {
       void this.scheduleTextureUpdate()
     }
 
+    if (this.maskTextureDirty && this.maskEnabled) {
+      this.updateMaskTexture()
+    }
+
     if (this.needsRender) {
       this.render()
       this.needsRender = false
@@ -425,6 +609,10 @@ export class VolumeRenderer {
 
     if (this.volumeTexture) {
       this.volumeTexture.dispose()
+    }
+
+    if (this.maskTexture) {
+      this.maskTexture.dispose()
     }
 
     if (this.doubleBuffer) {

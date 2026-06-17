@@ -4,14 +4,27 @@
       <span class="viewport-title">{{ planeLabel }}</span>
       <span class="viewport-index">{{ currentSlice }} / {{ maxSlice }}</span>
     </div>
-    <div ref="viewportRef" class="viewport-container"></div>
+    <div
+      ref="viewportRef"
+      class="viewport-container"
+      :class="{ 'mask-cursor': maskToolMode === 'draw' || maskToolMode === 'erase' }"
+    ></div>
+
+    <div
+      v-if="showBrushIndicator && brushRadius > 0"
+      ref="brushCursorRef"
+      class="brush-indicator"
+      :style="brushCursorStyle"
+    >
+      <div class="brush-circle"></div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, watch, reactive } from 'vue'
 import { VolumeRenderer } from '@/rendering/VolumeRenderer'
-import type { VolumeData, MPRPlane } from '@/types'
+import type { VolumeData, MPRPlane, MaskToolMode } from '@/types'
 
 const props = defineProps<{
   plane: MPRPlane
@@ -20,14 +33,22 @@ const props = defineProps<{
   windowWidth: number
   windowLevel: number
   active?: boolean
+  maskEnabled?: boolean
+  maskOpacity?: number
+  brushRadius?: number
+  maskToolMode?: MaskToolMode
 }>()
 
 const emit = defineEmits<{
   (e: 'sliceChange', value: number): void
+  (e: 'maskChanged'): void
 }>()
 
 const viewportRef = ref<HTMLElement | null>(null)
+const brushCursorRef = ref<HTMLElement | null>(null)
 let renderer: VolumeRenderer | null = null
+
+const brushPosition = reactive({ x: 0, y: 0, visible: false })
 
 const planeLabels: Record<MPRPlane, string> = {
   axial: '轴状面 Axial',
@@ -39,6 +60,21 @@ const planeLabel = computed(() => planeLabels[props.plane])
 
 const currentSlice = ref(0)
 const maxSlice = ref(1)
+
+const showBrushIndicator = computed(() => {
+  return props.maskToolMode === 'draw' || props.maskToolMode === 'erase'
+})
+
+const brushCursorStyle = computed(() => {
+  const size = (props.brushRadius || 5) * 4
+  return {
+    width: `${size}px`,
+    height: `${size}px`,
+    left: `${brushPosition.x - size / 2}px`,
+    top: `${brushPosition.y - size / 2}px`,
+    opacity: brushPosition.visible ? 1 : 0
+  }
+})
 
 watch(() => props.volumeData, (newData) => {
   if (renderer && newData) {
@@ -62,14 +98,59 @@ watch([() => props.windowWidth, () => props.windowLevel], ([ww, wl]) => {
   }
 })
 
+watch(() => props.maskEnabled, (enabled) => {
+  if (renderer && enabled !== undefined) {
+    renderer.setMaskEnabled(enabled)
+  }
+})
+
+watch(() => props.maskOpacity, (opacity) => {
+  if (renderer && opacity !== undefined) {
+    renderer.setMaskOpacity(opacity)
+  }
+})
+
+watch(() => props.brushRadius, (radius) => {
+  if (renderer && radius !== undefined) {
+    renderer.setBrushRadius(radius)
+  }
+})
+
+watch(() => props.maskToolMode, (mode) => {
+  if (renderer && mode !== undefined) {
+    renderer.setMaskToolMode(mode)
+  }
+})
+
 onMounted(() => {
   if (viewportRef.value) {
     renderer = new VolumeRenderer(viewportRef.value, props.plane)
+
+    renderer.setOnMaskChanged(() => {
+      emit('maskChanged')
+    })
 
     if (props.volumeData) {
       renderer.setVolumeData(props.volumeData)
       maxSlice.value = renderer.getMaxSliceIndex()
     }
+
+    if (props.maskEnabled !== undefined) {
+      renderer.setMaskEnabled(props.maskEnabled)
+    }
+    if (props.maskOpacity !== undefined) {
+      renderer.setMaskOpacity(props.maskOpacity)
+    }
+    if (props.brushRadius !== undefined) {
+      renderer.setBrushRadius(props.brushRadius)
+    }
+    if (props.maskToolMode !== undefined) {
+      renderer.setMaskToolMode(props.maskToolMode)
+    }
+
+    viewportRef.value.addEventListener('mousemove', handleMouseMove)
+    viewportRef.value.addEventListener('mouseenter', handleMouseEnter)
+    viewportRef.value.addEventListener('mouseleave', handleMouseLeave)
 
     window.addEventListener('resize', handleResize)
   }
@@ -77,17 +158,48 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+
+  if (viewportRef.value) {
+    viewportRef.value.removeEventListener('mousemove', handleMouseMove)
+    viewportRef.value.removeEventListener('mouseenter', handleMouseEnter)
+    viewportRef.value.removeEventListener('mouseleave', handleMouseLeave)
+  }
+
   if (renderer) {
     renderer.dispose()
     renderer = null
   }
 })
 
+function handleMouseMove(e: MouseEvent) {
+  if (viewportRef.value) {
+    const rect = viewportRef.value.getBoundingClientRect()
+    brushPosition.x = e.clientX - rect.left
+    brushPosition.y = e.clientY - rect.top
+  }
+}
+
+function handleMouseEnter() {
+  brushPosition.visible = true
+}
+
+function handleMouseLeave() {
+  brushPosition.visible = false
+}
+
 function handleResize() {
   if (renderer) {
     renderer.resize()
   }
 }
+
+function getRenderer(): VolumeRenderer | null {
+  return renderer
+}
+
+defineExpose({
+  getRenderer
+})
 </script>
 
 <style lang="scss" scoped>
@@ -147,5 +259,25 @@ function handleResize() {
   &:active {
     cursor: grabbing;
   }
+
+  &.mask-cursor {
+    cursor: none;
+  }
+}
+
+.brush-indicator {
+  position: absolute;
+  pointer-events: none;
+  z-index: 20;
+  transition: opacity 0.15s ease;
+}
+
+.brush-circle {
+  width: 100%;
+  height: 100%;
+  border: 2px solid #00e5ff;
+  border-radius: 50%;
+  box-shadow: 0 0 10px rgba(0, 229, 255, 0.5), inset 0 0 10px rgba(0, 229, 255, 0.2);
+  box-sizing: border-box;
 }
 </style>

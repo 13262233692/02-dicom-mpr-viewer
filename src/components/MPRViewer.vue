@@ -22,25 +22,47 @@
           @click="setActiveView(plane)"
         >
           <ViewportPanel
+            :ref="(el) => setViewportRef(plane, el)"
             :plane="plane"
             :volume-data="volumeData"
             :slice-index="sliceIndices[plane]"
             :window-width="windowWidth"
             :window-level="windowLevel"
             :active="activeView === plane"
+            :mask-enabled="maskEnabled"
+            :mask-opacity="maskOpacity"
+            :brush-radius="brushRadius"
+            :mask-tool-mode="maskToolMode"
             @slice-change="(idx) => onSliceChange(plane, idx)"
+            @mask-changed="onMaskChanged"
           />
         </div>
       </div>
 
-      <ControlPanel
-        :volume-data="volumeData"
-        :slice-indices="sliceIndices"
-        :window-width="windowWidth"
-        :window-level="windowLevel"
-        @slice-change="handleSliceChange"
-        @window-change="handleWindowChange"
-      />
+      <div class="side-panels">
+        <ControlPanel
+          :volume-data="volumeData"
+          :slice-indices="sliceIndices"
+          :window-width="windowWidth"
+          :window-level="windowLevel"
+          @slice-change="handleSliceChange"
+          @window-change="handleWindowChange"
+        />
+
+        <MaskPanel
+          :mask-enabled="maskEnabled"
+          :mask-opacity="maskOpacity"
+          :brush-radius="brushRadius"
+          :tool-mode="maskToolMode"
+          :volume-result="maskVolumeResult"
+          :sphere-count="sphereCount"
+          @mask-enabled-change="handleMaskEnabledChange"
+          @mask-opacity-change="handleMaskOpacityChange"
+          @brush-radius-change="handleBrushRadiusChange"
+          @tool-mode-change="handleToolModeChange"
+          @clear-mask="handleClearMask"
+        />
+      </div>
     </div>
 
     <StatusBar
@@ -51,14 +73,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, computed } from 'vue'
 import Toolbar from '@/components/Toolbar.vue'
 import ViewportPanel from '@/components/ViewportPanel.vue'
 import ControlPanel from '@/components/ControlPanel.vue'
+import MaskPanel from '@/components/MaskPanel.vue'
 import StatusBar from '@/components/StatusBar.vue'
 import { generatePhantomVolume } from '@/volume/phantomData'
 import { buildVolumeFromDICOMSlices, parseDICOMFiles } from '@/dicom/dicomParser'
-import type { VolumeData, MPRPlane } from '@/types'
+import type { VolumeData, MPRPlane, MaskToolMode, MaskVolumeResult } from '@/types'
 
 const toolbarRef = ref<InstanceType<typeof Toolbar> | null>(null)
 
@@ -66,6 +89,12 @@ const layout = ref<'grid' | 'row' | 'col'>('grid')
 const activeView = ref<MPRPlane | null>(null)
 const volumeData = ref<VolumeData | null>(null)
 const isLoading = ref(false)
+
+const viewportRefs = reactive<Record<string, InstanceType<typeof ViewportPanel> | null>>({
+  axial: null,
+  sagittal: null,
+  coronal: null
+})
 
 const planes: MPRPlane[] = ['axial', 'sagittal', 'coronal']
 
@@ -77,6 +106,28 @@ const sliceIndices = reactive<Record<MPRPlane, number>>({
 
 const windowWidth = ref(2000)
 const windowLevel = ref(1000)
+
+const maskEnabled = ref(true)
+const maskOpacity = ref(0.85)
+const brushRadius = ref(8)
+const maskToolMode = ref<MaskToolMode>('none')
+const maskVolumeResult = ref<MaskVolumeResult | null>(null)
+
+const sphereCount = computed(() => {
+  const firstViewport = viewportRefs.axial
+  if (firstViewport) {
+    const renderer = firstViewport.getRenderer?.()
+    if (renderer) {
+      const manager = renderer.getMaskManager()
+      return manager.getSphereCount()
+    }
+  }
+  return 0
+})
+
+function setViewportRef(plane: string, el: unknown) {
+  viewportRefs[plane] = el as InstanceType<typeof ViewportPanel> | null
+}
 
 onMounted(() => {
   loadDemoData()
@@ -153,6 +204,75 @@ function handleWindowChange(width: number, level: number) {
   windowWidth.value = width
   windowLevel.value = level
 }
+
+function handleMaskEnabledChange(enabled: boolean) {
+  maskEnabled.value = enabled
+}
+
+function handleMaskOpacityChange(opacity: number) {
+  maskOpacity.value = opacity
+}
+
+function handleBrushRadiusChange(radius: number) {
+  brushRadius.value = radius
+}
+
+function handleToolModeChange(mode: MaskToolMode) {
+  maskToolMode.value = mode
+}
+
+function handleClearMask() {
+  planes.forEach(plane => {
+    const viewport = viewportRefs[plane]
+    if (viewport) {
+      const renderer = viewport.getRenderer?.()
+      if (renderer) {
+        renderer.clearMask()
+      }
+    }
+  })
+  updateVolumeResult()
+}
+
+function onMaskChanged() {
+  syncMaskAcrossViewports()
+  updateVolumeResult()
+}
+
+function syncMaskAcrossViewports() {
+  const sourceViewport = viewportRefs[activeView.value || 'axial']
+  if (!sourceViewport) return
+
+  const sourceRenderer = sourceViewport.getRenderer?.()
+  if (!sourceRenderer) return
+
+  const sourceManager = sourceRenderer.getMaskManager()
+  const spheres = sourceManager.getSpheres()
+
+  planes.forEach(plane => {
+    if (plane === activeView.value) return
+
+    const targetViewport = viewportRefs[plane]
+    if (targetViewport) {
+      const targetRenderer = targetViewport.getRenderer?.()
+      if (targetRenderer) {
+        const targetManager = targetRenderer.getMaskManager()
+        targetManager.setSpheres(spheres)
+      }
+    }
+  })
+}
+
+function updateVolumeResult() {
+  const viewport = viewportRefs.axial || viewportRefs.sagittal || viewportRefs.coronal
+  if (viewport) {
+    const renderer = viewport.getRenderer?.()
+    if (renderer) {
+      const manager = renderer.getMaskManager()
+      maskVolumeResult.value = manager.calculateTotalVolume()
+    }
+  }
+}
 </script>
 
 <style lang="scss" scoped>
@@ -213,5 +333,17 @@ function handleWindowChange(width: number, level: number) {
   position: relative;
   min-height: 0;
   min-width: 0;
+}
+
+.side-panels {
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+
+  > :deep(*) {
+    flex-shrink: 0;
+  }
 }
 </style>
