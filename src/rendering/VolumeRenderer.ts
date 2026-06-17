@@ -1,7 +1,12 @@
 import * as THREE from 'three'
 import type { VolumeData, MPRPlane, MPRViewState, ViewportSize } from '@/types'
+import { DoubleBufferManager } from '@/concurrency/DoubleBufferManager'
+import { TaskScheduler, debounceWithPriority, TASK_PRIORITY_HIGH, TASK_PRIORITY_CRITICAL } from '@/concurrency/TaskScheduler'
 import vertexShader from './shaders/volume.vert?raw'
 import fragmentShader from './shaders/volume.frag?raw'
+
+const TEXTURE_UPDATE_DEBOUNCE_MS = 16
+const VOLUME_VALUE_SCALE = 4095.0
 
 export class VolumeRenderer {
   private scene: THREE.Scene
@@ -18,6 +23,16 @@ export class VolumeRenderer {
   private isDragging: boolean = false
   private lastMousePos: { x: number; y: number } = { x: 0, y: 0 }
 
+  private doubleBuffer: DoubleBufferManager | null = null
+  private lastFrameCounter: number = -1
+  private textureUploadScheduler: TaskScheduler
+  private textureNeedsUpdate: boolean = false
+  private currentFrameToken: number = 0
+  private lastUploadedFrame: number = -1
+
+  private pendingWindowWidth: number | null = null
+  private pendingWindowLevel: number | null = null
+
   constructor(container: HTMLElement, plane: MPRPlane) {
     this.container = container
     this.viewState = {
@@ -29,6 +44,8 @@ export class VolumeRenderer {
       pan: { x: 0, y: 0 }
     }
 
+    this.textureUploadScheduler = new TaskScheduler(1)
+
     this.scene = new THREE.Scene()
     this.scene.background = new THREE.Color(0x0f1218)
 
@@ -37,10 +54,12 @@ export class VolumeRenderer {
 
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
-      alpha: false
+      alpha: false,
+      preserveDrawingBuffer: false
     })
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
     this.renderer.setSize(container.clientWidth, container.clientHeight)
+    this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace
 
     container.appendChild(this.renderer.domElement)
 
@@ -51,7 +70,7 @@ export class VolumeRenderer {
   private setupEventListeners(): void {
     const canvas = this.renderer.domElement
 
-    canvas.addEventListener('wheel', this.handleWheel.bind(this))
+    canvas.addEventListener('wheel', this.handleWheel.bind(this), { passive: false })
     canvas.addEventListener('mousedown', this.handleMouseDown.bind(this))
     window.addEventListener('mousemove', this.handleMouseMove.bind(this))
     window.addEventListener('mouseup', this.handleMouseUp.bind(this))
@@ -106,11 +125,76 @@ export class VolumeRenderer {
 
     if (this.volumeTexture) {
       this.volumeTexture.dispose()
+      this.volumeTexture = null
     }
 
     const { width, height, depth } = volumeData.dimensions
+    const voxelCount = width * height * depth
     const voxelData = volumeData.voxelData
 
+    const useSharedBuffer = typeof SharedArrayBuffer !== 'undefined'
+
+    if (useSharedBuffer) {
+      try {
+        this.doubleBuffer = new DoubleBufferManager(voxelCount, 1)
+
+        const normalizedData = new Uint8Array(voxelCount)
+        const minVal = volumeData.minValue
+        const maxVal = volumeData.maxValue
+        const range = maxVal - minVal > 0 ? maxVal - minVal : 1
+
+        for (let i = 0; i < voxelData.length && i < voxelCount; i++) {
+          normalizedData[i] = Math.floor(((voxelData[i] - minVal) / range) * 255)
+        }
+
+        this.doubleBuffer.writeToBackBuffer(normalizedData, false)
+        this.lastFrameCounter = this.doubleBuffer.getFrameCounter()
+
+        const frontBuffer = this.doubleBuffer.getFrontBufferForReadBlocking()
+        this.volumeTexture = this.create3DTexture(frontBuffer, width, height, depth)
+        this.lastUploadedFrame = this.lastFrameCounter
+      } catch (e) {
+        console.warn('SharedArrayBuffer 初始化失败，回退到普通缓冲区:', e)
+        this.doubleBuffer = null
+        this.volumeTexture = this.create3DTextureFromVolume(volumeData)
+      }
+    } else {
+      this.doubleBuffer = null
+      this.volumeTexture = this.create3DTextureFromVolume(volumeData)
+    }
+
+    this.viewState.windowLevel = (volumeData.minValue + volumeData.maxValue) / 2
+    this.viewState.windowWidth = volumeData.maxValue - volumeData.minValue
+
+    if (this.viewState.windowWidth <= 0) {
+      this.viewState.windowWidth = 100
+    }
+
+    this.createPlaneMesh()
+    this.updateMaterialUniforms()
+    this.needsRender = true
+  }
+
+  private create3DTexture(data: Uint8Array, width: number, height: number, depth: number): THREE.Data3DTexture {
+    const textureData = new Uint8Array(data)
+
+    const texture = new THREE.Data3DTexture(textureData, width, height, depth)
+    texture.format = THREE.RedFormat
+    texture.type = THREE.UnsignedByteType
+    texture.minFilter = THREE.LinearFilter
+    texture.magFilter = THREE.LinearFilter
+    texture.wrapS = THREE.ClampToEdgeWrapping
+    texture.wrapT = THREE.ClampToEdgeWrapping
+    texture.wrapR = THREE.ClampToEdgeWrapping
+    texture.needsUpdate = true
+    texture.unpackAlignment = 1
+
+    return texture
+  }
+
+  private create3DTextureFromVolume(volumeData: VolumeData): THREE.Data3DTexture {
+    const { width, height, depth } = volumeData.dimensions
+    const voxelData = volumeData.voxelData
     const data = new Uint8Array(width * height * depth)
 
     const minVal = volumeData.minValue
@@ -121,26 +205,7 @@ export class VolumeRenderer {
       data[i] = Math.floor(((voxelData[i] - minVal) / range) * 255)
     }
 
-    this.volumeTexture = new THREE.Data3DTexture(data, width, height, depth)
-    this.volumeTexture.format = THREE.RedFormat
-    this.volumeTexture.type = THREE.UnsignedByteType
-    this.volumeTexture.minFilter = THREE.LinearFilter
-    this.volumeTexture.magFilter = THREE.LinearFilter
-    this.volumeTexture.wrapS = THREE.ClampToEdgeWrapping
-    this.volumeTexture.wrapT = THREE.ClampToEdgeWrapping
-    this.volumeTexture.wrapR = THREE.ClampToEdgeWrapping
-    this.volumeTexture.needsUpdate = true
-
-    this.viewState.windowLevel = (minVal + maxVal) / 2
-    this.viewState.windowWidth = maxVal - minVal
-
-    if (this.viewState.windowWidth <= 0) {
-      this.viewState.windowWidth = 100
-    }
-
-    this.createPlaneMesh()
-    this.updateMaterialUniforms()
-    this.needsRender = true
+    return this.create3DTexture(data, width, height, depth)
   }
 
   private createPlaneMesh(): void {
@@ -153,7 +218,6 @@ export class VolumeRenderer {
     }
 
     const geometry = new THREE.PlaneGeometry(2, 2)
-
     const planeType = this.getPlaneTypeInt()
 
     this.material = new THREE.ShaderMaterial({
@@ -178,8 +242,12 @@ export class VolumeRenderer {
         u_zoom: { value: this.viewState.zoom },
         u_pan: { value: new THREE.Vector2(this.viewState.pan.x, this.viewState.pan.y) },
         u_minValue: { value: this.volumeData?.minValue || 0 },
-        u_maxValue: { value: this.volumeData?.maxValue || 0 }
-      }
+        u_maxValue: { value: this.volumeData?.maxValue || 0 },
+        u_valueScale: { value: VOLUME_VALUE_SCALE },
+        u_frameToken: { value: 0.0 }
+      },
+      depthTest: false,
+      depthWrite: false
     })
 
     this.planeMesh = new THREE.Mesh(geometry, this.material)
@@ -205,6 +273,51 @@ export class VolumeRenderer {
     this.material.uniforms.u_pan.value.set(this.viewState.pan.x, this.viewState.pan.y)
   }
 
+  private scheduleTextureUpdate = debounceWithPriority(
+    async () => {
+      if (!this.doubleBuffer || !this.volumeTexture || !this.material) {
+        return
+      }
+
+      const currentFrame = this.doubleBuffer.getFrameCounter()
+      if (currentFrame === this.lastUploadedFrame) {
+        return
+      }
+
+      const frameToken = ++this.currentFrameToken
+      const frontBuffer = this.doubleBuffer.getFrontBufferForRead()
+
+      if (!frontBuffer) {
+        return
+      }
+
+      await this.textureUploadScheduler.schedule(async () => {
+        if (frameToken !== this.currentFrameToken) {
+          return
+        }
+
+        if (!this.volumeTexture || !this.material) {
+          return
+        }
+
+        const textureImage = this.volumeTexture.image
+        if (textureImage && textureImage.data) {
+          const dstData = textureImage.data as unknown as Uint8Array
+          dstData.set(frontBuffer)
+        }
+
+        this.volumeTexture.needsUpdate = true
+        this.material.uniforms.u_frameToken.value = frameToken
+
+        this.lastUploadedFrame = currentFrame
+        this.needsRender = true
+      }, TASK_PRIORITY_HIGH)
+    },
+    TEXTURE_UPDATE_DEBOUNCE_MS,
+    new TaskScheduler(1),
+    TASK_PRIORITY_CRITICAL
+  )
+
   setSliceIndex(index: number): void {
     const maxIndex = this.getMaxSliceIndex()
     this.viewState.sliceIndex = Math.max(0, Math.min(1, index / maxIndex))
@@ -229,6 +342,9 @@ export class VolumeRenderer {
   }
 
   setWindowLevel(windowWidth: number, windowLevel: number): void {
+    this.pendingWindowWidth = windowWidth
+    this.pendingWindowLevel = windowLevel
+
     this.viewState.windowWidth = windowWidth
     this.viewState.windowLevel = windowLevel
     this.updateMaterialUniforms()
@@ -243,6 +359,20 @@ export class VolumeRenderer {
     Object.assign(this.viewState, state)
     this.updateMaterialUniforms()
     this.needsRender = true
+  }
+
+  getDoubleBuffer(): DoubleBufferManager | null {
+    return this.doubleBuffer
+  }
+
+  requestTextureUpdate(): void {
+    if (this.doubleBuffer) {
+      const currentFrame = this.doubleBuffer.getFrameCounter()
+      if (currentFrame !== this.lastFrameCounter) {
+        this.lastFrameCounter = currentFrame
+        this.textureNeedsUpdate = true
+      }
+    }
   }
 
   resize(): void {
@@ -264,6 +394,12 @@ export class VolumeRenderer {
 
   private animate(): void {
     this.animationFrameId = requestAnimationFrame(this.animate.bind(this))
+
+    this.requestTextureUpdate()
+    if (this.textureNeedsUpdate && this.doubleBuffer) {
+      this.textureNeedsUpdate = false
+      void this.scheduleTextureUpdate()
+    }
 
     if (this.needsRender) {
       this.render()
@@ -291,6 +427,10 @@ export class VolumeRenderer {
       this.volumeTexture.dispose()
     }
 
+    if (this.doubleBuffer) {
+      this.doubleBuffer.dispose()
+    }
+
     if (this.planeMesh) {
       this.scene.remove(this.planeMesh)
       this.planeMesh.geometry.dispose()
@@ -300,6 +440,8 @@ export class VolumeRenderer {
     }
 
     this.renderer.dispose()
-    this.container.removeChild(this.renderer.domElement)
+    if (this.renderer.domElement.parentNode === this.container) {
+      this.container.removeChild(this.renderer.domElement)
+    }
   }
 }
